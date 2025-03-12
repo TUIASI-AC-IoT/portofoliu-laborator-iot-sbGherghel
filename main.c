@@ -10,6 +10,12 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+
+#include <freertos/FreeRTOS.h>
+#include <freertos/timers.h>
+
+TimerHandle_t periodicTimer;
+
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -22,12 +28,8 @@
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
 
-
-#include "driver/gpio.h"
-#define GPIO_OUTPUT_IO 4
-#define GPIO_OUTPUT_PIN_SEL (1ULL<<GPIO_OUTPUT_IO)
-
-
+#include "..\mdns\include\mdns.h"
+#include "..\mdns\include\mdns_console.h"
 
 #define CONFIG_ESP_WIFI_SSID      "lab-iot"
 #define CONFIG_ESP_WIFI_PASS      "IoT-IoT-IoT"
@@ -46,7 +48,96 @@ static EventGroupHandle_t s_wifi_event_group;
 static const char *TAG = "wifi station";
 
 static int s_retry_num = 0;
+void vTask_handler(TimerHandle_t xTimer);
+void start_mdns_service()
+{
+    //initialize mDNS service
+    esp_err_t err = mdns_init();
+    if (err) {
+        printf("MDNS Init failed: %d\n", err);
+        return;
+    }
 
+    //set hostname
+    mdns_hostname_set("esp32-Gherghel"); 
+    //set default instance
+    mdns_instance_name_set(" ESP32 Lab 4");
+}
+
+void resolve_mdns_host(const char * host_name)
+{
+    printf("Query A: %s.local", host_name);
+
+    esp_ip4_addr_t addr;
+    addr.addr = 0;
+
+    esp_err_t err = mdns_query_a(host_name, 2000,  &addr);
+    if(err){
+        if(err == ESP_ERR_NOT_FOUND){
+            printf("Host was not found!");
+            return;
+        }
+        printf("Query Failed");
+        return;
+    }
+
+    printf(IPSTR, IP2STR(&addr));
+}
+
+static const char * if_str[] = {"STA", "AP", "ETH", "MAX"};
+static const char * ip_protocol_str[] = {"V4", "V6", "MAX"};
+
+void mdns_print_results(mdns_result_t * results){
+    mdns_result_t * r = results;
+    mdns_ip_addr_t * a = NULL;
+    int i = 1, t;
+    while(r){
+        printf("%d: Interface:, Type: %s\n", i++, ip_protocol_str[r->ip_protocol]);
+        if(r->instance_name){
+            printf("  PTR : %s\n", r->instance_name);
+        }
+        if(r->hostname){
+            printf("  SRV : %s.local:%u\n", r->hostname, r->port);
+        }
+        if(r->txt_count){
+            printf("  TXT : [%u] ", r->txt_count);
+            for(t=0; t<r->txt_count; t++){
+                printf("%s=%s; ", r->txt[t].key, r->txt[t].value);
+            }
+            printf("\n");
+        }
+        a = r->addr;
+        while(a){
+            if(a->addr.type == IPADDR_TYPE_V6){
+                printf("  AAAA: " IPV6STR "\n", IPV62STR(a->addr.u_addr.ip6));
+            } else {
+                printf("  A   : " IPSTR "\n", IP2STR(&(a->addr.u_addr.ip4)));
+            }
+            a = a->next;
+        }
+        r = r->next;
+    }
+
+}
+
+void find_mdns_service(const char * service_name, const char * proto)
+{
+    ESP_LOGI(TAG, "Query PTR: %s.%s.local", service_name, proto);
+
+    mdns_result_t * results = NULL;
+    esp_err_t err = mdns_query_ptr(service_name, proto, 3000, 20,  &results);
+    if(err){
+        ESP_LOGE(TAG, "Query Failed");
+        return;
+    }
+    if(!results){
+        ESP_LOGW(TAG, "No results found!");
+        return;
+    }
+
+    mdns_print_results(results);
+    mdns_query_results_free(results);
+}
 
 static void event_handler(void* arg, esp_event_base_t event_base,
                                 int32_t event_id, void* event_data)
@@ -185,14 +276,6 @@ static void udp_task(void *pvParameters)
                 rx_buffer[len] = 0; // Null-terminate whatever we received and treat like a string
                 ESP_LOGI(TAG, "Received %d bytes from %s:", len, addr_str);
                 ESP_LOGI(TAG, "%s", rx_buffer);
-                
-                if(strcmp(rx_buffer, "GPIO4=0")){
-                    gpio_set_level(GPIO_OUTPUT_IO, 0);
-                }
-                else{
-                    gpio_set_level(GPIO_OUTPUT_IO, 1);
-                }
-
             }
 
             vTaskDelay(200 / portTICK_PERIOD_MS);
@@ -209,22 +292,6 @@ static void udp_task(void *pvParameters)
 
 void app_main(void)
 {
-
-        //zero-initialize the config structure.
-    gpio_config_t io_conf = {};
-    //disable interrupt
-    io_conf.intr_type = GPIO_INTR_DISABLE;
-    //set as output mode
-    io_conf.mode = GPIO_MODE_OUTPUT;
-    //bit mask of the pins that you want to set
-    io_conf.pin_bit_mask = GPIO_OUTPUT_PIN_SEL;
-    //disable pull-down mode
-    io_conf.pull_down_en = 0;
-    //disable pull-up mode
-    io_conf.pull_up_en = 0;
-    //configure GPIO with the given settings
-    gpio_config(&io_conf);
-
     //Initialize NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -237,8 +304,49 @@ void app_main(void)
     bool connected = wifi_init_sta();
 
     if (connected) {
+        start_mdns_service();
         xTaskCreate(udp_task, "udp_task", 4096, NULL, 5, NULL);
     }
+    
+   // xTaskCreate(vTask_handler, "vTask_handler", 4096, NULL, 5, NULL);    
+    //search for esp32-mdns.local
+    resolve_mdns_host("esp32-Gherghel");
 
+    find_mdns_service("_services._dns-sd", "_udp");
+
+    periodicTimer = xTimerCreate(
+        "Periodic Timer",
+        pdMS_TO_TICKS(1000), 
+        pdTRUE,          
+        (void *)0,         
+        vTask_handler       
+    );
+
+    if (periodicTimer != NULL) {
+        xTimerStart(periodicTimer, 0);
+      }
 
 }
+
+
+void vTask_handler(TimerHandle_t xTimer) {
+    resolve_mdns_host("esp32-Ghegrhel");
+
+    find_mdns_service("_services._dns-sd", "_udp");
+    find_mdns_service("_services", "_dns-sd._udp");
+
+    //search for esp32-mdns.local
+    resolve_mdns_host("esp32-mdns");
+
+    //search for HTTP servers
+    find_mdns_service("_http", "_tcp");
+    //or file servers
+    find_mdns_service("_smb", "_tcp"); //windows sharing
+    find_mdns_service("_afpovertcp", "_tcp"); //apple sharing
+    find_mdns_service("_nfs", "_tcp"); //NFS server
+    find_mdns_service("_ftp", "_tcp"); //FTP server
+    //or networked printer
+    find_mdns_service("_printer", "_tcp");
+    find_mdns_service("_ipp", "_tcp");
+
+  }
